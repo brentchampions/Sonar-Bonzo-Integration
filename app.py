@@ -126,22 +126,22 @@ async def receive_sonar(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
-    print("=== INCOMING FROM SONAR ===")
-    print(json.dumps(data, indent=2, default=str))
+    print("=== INCOMING FROM SONAR ===", flush=True)
+    print(json.dumps(data, indent=2, default=str), flush=True)
 
     bonzo_payload = map_sonar_to_bonzo(data)
 
-    print("=== SENDING TO BONZO ===")
-    print(json.dumps(bonzo_payload, indent=2, default=str))
+    print("=== SENDING TO BONZO ===", flush=True)
+    print(json.dumps(bonzo_payload, indent=2, default=str), flush=True)
 
     try:
         response = requests.post(BONZO_URL, json=bonzo_payload, timeout=30)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error sending to Bonzo: {e}")
 
-    print("=== BONZO RESPONSE ===")
-    print("Status:", response.status_code)
-    print("Body:", response.text)
+    print("=== BONZO RESPONSE ===", flush=True)
+    print(f"Status: {response.status_code}", flush=True)
+    print(f"Body: {response.text}", flush=True)
 
     return {
         "status": "sent_to_bonzo",
