@@ -2,10 +2,19 @@ from fastapi import FastAPI, Request, HTTPException, Response
 import requests
 import os
 import json
+import time
+import hashlib
 
 app = FastAPI()
 
 BONZO_URL = os.getenv("BONZO_URL")
+
+# in-memory dedupe cache
+# fingerprint -> last_seen_unix
+recent_payloads = {}
+
+# how long to suppress identical payloads (seconds)
+DEDUP_WINDOW_SECONDS = 60 * 30  # 30 minutes
 
 
 @app.get("/")
@@ -61,6 +70,39 @@ def to_number(value):
 def to_int(value):
     n = to_number(value)
     return int(n) if n is not None else None
+
+
+def remove_empty(obj):
+    if isinstance(obj, dict):
+        cleaned = {}
+        for k, v in obj.items():
+            v2 = remove_empty(v)
+            if v2 not in (None, "", [], {}):
+                cleaned[k] = v2
+        return cleaned
+    if isinstance(obj, list):
+        cleaned = [remove_empty(v) for v in obj]
+        return [v for v in cleaned if v not in (None, "", [], {})]
+    return obj
+
+
+def fingerprint_payload(data):
+    """
+    Create a stable fingerprint of the incoming Sonar payload.
+    Empty values are removed so trivial blanks do not create false differences.
+    """
+    normalized = remove_empty(data)
+    stable_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(stable_json.encode("utf-8")).hexdigest(), stable_json
+
+
+def purge_old_fingerprints(now_ts):
+    expired = [
+        fp for fp, ts in recent_payloads.items()
+        if now_ts - ts > DEDUP_WINDOW_SECONDS
+    ]
+    for fp in expired:
+        del recent_payloads[fp]
 
 
 def map_sonar_to_bonzo(data):
@@ -128,6 +170,44 @@ async def receive_sonar(request: Request):
 
     print("=== INCOMING FROM SONAR ===", flush=True)
     print(json.dumps(data, indent=2, default=str), flush=True)
+
+    # basic quality gates
+    first_name = clean(data.get("FirstName"))
+    last_name = clean(data.get("LastName"))
+    email = clean(data.get("Email"))
+    phone = clean_phone(data.get("DayPhone"))
+    loan_id = clean(data.get("LoanId")) or clean(data.get("RefId"))
+
+    if not first_name or not last_name:
+        print("=== IGNORED === missing first/last name", flush=True)
+        return {"status": "ignored", "reason": "missing first/last name"}
+
+    if not email and not phone:
+        print("=== IGNORED === missing both email and phone", flush=True)
+        return {"status": "ignored", "reason": "missing both email and phone"}
+
+    if not loan_id:
+        print("=== IGNORED === missing loan/ref id", flush=True)
+        return {"status": "ignored", "reason": "missing loan/ref id"}
+
+    # dedupe exact same payload
+    now_ts = time.time()
+    purge_old_fingerprints(now_ts)
+
+    fingerprint, stable_json = fingerprint_payload(data)
+
+    if fingerprint in recent_payloads:
+        print("=== IGNORED DUPLICATE PAYLOAD ===", flush=True)
+        print(f"Fingerprint: {fingerprint}", flush=True)
+        print(stable_json, flush=True)
+        return {
+            "status": "ignored",
+            "reason": "duplicate identical payload",
+            "loan_id": loan_id,
+            "fingerprint": fingerprint
+        }
+
+    recent_payloads[fingerprint] = now_ts
 
     bonzo_payload = map_sonar_to_bonzo(data)
 
