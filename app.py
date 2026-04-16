@@ -3,18 +3,22 @@ import requests
 import os
 import json
 import time
-import hashlib
 
 app = FastAPI()
 
 BONZO_URL = os.getenv("BONZO_URL")
 
-# in-memory dedupe cache
-# fingerprint -> last_seen_unix
-recent_payloads = {}
+# In-memory loan state
+# loan_id -> {
+#   "first_sent": bool,
+#   "submitted_seen": bool,
+#   "last_post_submit_signature": str | None,
+#   "last_seen_ts": float,
+# }
+loan_state = {}
 
-# how long to suppress identical payloads (seconds)
-DEDUP_WINDOW_SECONDS = 60 * 30  # 30 minutes
+# Clean up stale in-memory state after this many seconds
+STATE_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
 
 @app.get("/")
@@ -72,37 +76,27 @@ def to_int(value):
     return int(n) if n is not None else None
 
 
-def remove_empty(obj):
-    if isinstance(obj, dict):
-        cleaned = {}
-        for k, v in obj.items():
-            v2 = remove_empty(v)
-            if v2 not in (None, "", [], {}):
-                cleaned[k] = v2
-        return cleaned
-    if isinstance(obj, list):
-        cleaned = [remove_empty(v) for v in obj]
-        return [v for v in cleaned if v not in (None, "", [], {})]
-    return obj
-
-
-def fingerprint_payload(data):
-    """
-    Create a stable fingerprint of the incoming Sonar payload.
-    Empty values are removed so trivial blanks do not create false differences.
-    """
-    normalized = remove_empty(data)
-    stable_json = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(stable_json.encode("utf-8")).hexdigest(), stable_json
-
-
-def purge_old_fingerprints(now_ts):
-    expired = [
-        fp for fp, ts in recent_payloads.items()
-        if now_ts - ts > DEDUP_WINDOW_SECONDS
+def purge_old_state(now_ts: float):
+    expired_ids = [
+        loan_id
+        for loan_id, state in loan_state.items()
+        if now_ts - state.get("last_seen_ts", now_ts) > STATE_TTL_SECONDS
     ]
-    for fp in expired:
-        del recent_payloads[fp]
+    for loan_id in expired_ids:
+        del loan_state[loan_id]
+
+
+def build_post_submit_signature(data):
+    """
+    Only track fields that matter for post-submit Bonzo pipeline movement.
+    If these do not change, we suppress the update.
+    """
+    tracked = {
+        "LeadStage": clean(data.get("LeadStage")),
+        "LoanStatus": clean(data.get("LoanStatus")),
+        "Milestone": clean(data.get("Milestone")),
+    }
+    return json.dumps(tracked, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def map_sonar_to_bonzo(data):
@@ -114,7 +108,7 @@ def map_sonar_to_bonzo(data):
             tags.append(f"{key.lower()}:{val.lower()}")
 
     payload = {
-        # basic prospect fields Bonzo is already accepting
+        # core prospect fields
         "first_name": clean(data.get("FirstName")) or "Unknown",
         "last_name": clean(data.get("LastName")) or "Unknown",
         "email": clean(data.get("Email")),
@@ -127,7 +121,7 @@ def map_sonar_to_bonzo(data):
         "custom_id": clean(data.get("RefId")),
         "tags": ", ".join(tags),
 
-        # extra fields for Bonzo webhook mapping tab
+        # Bonzo mapping fields
         "loan_amount": to_number(data.get("LoanAmount")),
         "purchase_price": to_number(data.get("PurchasePrice")),
         "down_payment": to_number(data.get("DownPaymentAmount")),
@@ -142,7 +136,7 @@ def map_sonar_to_bonzo(data):
         "credit_score": to_int(data.get("CreditScore")),
         "household_income": to_number(data.get("TotalHouseholdIncome")),
         "monthly_mortgage_payment": to_number(data.get("MonthlyMortgagePayment")),
-        "lead_source": "Sonar",
+        "lead_source": clean(data.get("Source")) or "Sonar",
         "lead_id": clean(data.get("LoanId")),
         "loan_status": clean(data.get("LoanStatus")),
         "milestone": clean(data.get("Milestone")),
@@ -156,6 +150,60 @@ def map_sonar_to_bonzo(data):
     }
 
     return {k: v for k, v in payload.items() if v not in (None, "", [])}
+
+
+def should_send_to_bonzo(data, now_ts):
+    loan_id = clean(data.get("LoanId")) or clean(data.get("RefId"))
+    lead_stage = clean(data.get("LeadStage"))
+    loan_status = clean(data.get("LoanStatus"))
+    milestone = clean(data.get("Milestone"))
+
+    submitted_now = (
+        milestone == "ApplicationSubmitted"
+        or lead_stage == "Submit Application"
+        or loan_status == "Active"
+    )
+
+    state = loan_state.get(
+        loan_id,
+        {
+            "first_sent": False,
+            "submitted_seen": False,
+            "last_post_submit_signature": None,
+            "last_seen_ts": now_ts,
+        },
+    )
+    state["last_seen_ts"] = now_ts
+
+    # 1) Always allow the very first valid payload for a loan
+    if not state["first_sent"]:
+        state["first_sent"] = True
+        if submitted_now:
+            state["submitted_seen"] = True
+            state["last_post_submit_signature"] = build_post_submit_signature(data)
+        loan_state[loan_id] = state
+        return True, "first_valid_payload"
+
+    # 2) Before submission, block noisy intermediate updates
+    if not state["submitted_seen"]:
+        if submitted_now:
+            state["submitted_seen"] = True
+            state["last_post_submit_signature"] = build_post_submit_signature(data)
+            loan_state[loan_id] = state
+            return True, "application_submitted_transition"
+
+        loan_state[loan_id] = state
+        return False, "pre_submit_noise"
+
+    # 3) After submission, allow only meaningful pipeline-driving changes
+    current_signature = build_post_submit_signature(data)
+    if current_signature != state.get("last_post_submit_signature"):
+        state["last_post_submit_signature"] = current_signature
+        loan_state[loan_id] = state
+        return True, "post_submit_meaningful_change"
+
+    loan_state[loan_id] = state
+    return False, "post_submit_duplicate"
 
 
 @app.post("/sonar")
@@ -190,24 +238,24 @@ async def receive_sonar(request: Request):
         print("=== IGNORED === missing loan/ref id", flush=True)
         return {"status": "ignored", "reason": "missing loan/ref id"}
 
-    # dedupe exact same payload
     now_ts = time.time()
-    purge_old_fingerprints(now_ts)
+    purge_old_state(now_ts)
 
-    fingerprint, stable_json = fingerprint_payload(data)
+    should_send, reason = should_send_to_bonzo(data, now_ts)
 
-    if fingerprint in recent_payloads:
-        print("=== IGNORED DUPLICATE PAYLOAD ===", flush=True)
-        print(f"Fingerprint: {fingerprint}", flush=True)
-        print(stable_json, flush=True)
+    if not should_send:
+        print("=== IGNORED EVENT ===", flush=True)
+        print(f"LoanId: {loan_id}", flush=True)
+        print(f"Reason: {reason}", flush=True)
         return {
             "status": "ignored",
-            "reason": "duplicate identical payload",
             "loan_id": loan_id,
-            "fingerprint": fingerprint
+            "reason": reason,
         }
 
-    recent_payloads[fingerprint] = now_ts
+    print("=== ACCEPTED EVENT ===", flush=True)
+    print(f"LoanId: {loan_id}", flush=True)
+    print(f"Reason: {reason}", flush=True)
 
     bonzo_payload = map_sonar_to_bonzo(data)
 
@@ -225,7 +273,8 @@ async def receive_sonar(request: Request):
 
     return {
         "status": "sent_to_bonzo",
+        "reason": reason,
         "bonzo_status_code": response.status_code,
         "bonzo_response": response.text[:1000],
-        "sent_payload": bonzo_payload
+        "sent_payload": bonzo_payload,
     }
